@@ -1,0 +1,39 @@
+{
+  "model_version": "v1_frozen_confluence",
+  "liquidity": {
+    "min_avg_dollar_volume_20d": 20000000
+  },
+  "oversold_gate": {
+    "rsi14_max": 32,
+    "stoch14_max": 20,
+    "dist_sma20_min_pct": -4.0,
+    "dist_sma50_min_pct": -6.0,
+    "dist_sma200_min_pct": -8.0,
+    "roc20_max": -4.0,
+    "volume_capitulation_z_min": 1.0
+  },
+  "tplus1": {
+    "enable": true,
+    "extreme_rsi14_max": 24
+  },
+  "earnings": {
+    "exclude_if_earnings_within_days": 10,
+    "exclude_if_cannot_confirm": true
+  },
+  "scoring": {
+    "weights": {
+      "quant": 3,
+      "pattern": 3,
+      "fundamentals": 2,
+      "narrative": 2
+    },
+    "min_total_score_to_consider": 6.0
+  },
+  "risk_labels": {
+    "max_speculative_share": 0.25
+  },
+  "selection": {
+    "top_per_reset": 5,
+    "intersection_min_resets": 2
+  }
+}
