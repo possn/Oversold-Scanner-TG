@@ -1,122 +1,120 @@
-from __future__ import annotations
-
-import os
 import json
-import datetime as dt
+import os
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 
-from utils.telegram import send_telegram_message
+from utils.telegram import send_message
 
-HISTORY_PATH = "data/history.csv"
-CONFIG_PATH = "config.json"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
-def load_history() -> pd.DataFrame:
-    try:
-        df = pd.read_csv(HISTORY_PATH)
-        return df
-    except Exception:
-        return pd.DataFrame()
+HIST = "data/history.csv"
 
-def save_history(df: pd.DataFrame) -> None:
-    os.makedirs("data", exist_ok=True)
-    df.to_csv(HISTORY_PATH, index=False)
-
-def load_config() -> dict:
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+def load_cfg():
+    with open("config.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_config(cfg: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+def save_cfg(cfg):
+    with open("config.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-def evaluate_week(df: pd.DataFrame) -> dict:
-    """
-    Espera que history tenha colunas mínimas:
-    date, region, symbol, entry_close, max_3d, max_5d, min_5d
-    """
-    if df.empty:
-        return {"ok": False, "reason": "sem histórico"}
+def weekly_window():
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=7)
+    return start
 
-    # última semana (7 dias)
-    df["date"] = pd.to_datetime(df["date"])
-    cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=7)
-    w = df[df["date"] >= cutoff].copy()
-    if w.empty:
-        return {"ok": False, "reason": "sem dados na última semana"}
+def evaluate_week(df_week: pd.DataFrame):
+    # Basic success definition:
+    # success if max_3d >= entry_close OR max_5d >= entry_close*(1+0.5%) (proxy rebound)
+    # but we only compute if those fields already filled (they will fill over time)
+    # If missing: "insufficient outcome"
+    rows = []
+    for _, r in df_week.iterrows():
+        entry = r["close"]
+        try:
+            max3 = float(r["max_3d"]) if str(r["max_3d"]).strip() != "" else None
+            max5 = float(r["max_5d"]) if str(r["max_5d"]).strip() != "" else None
+            min5 = float(r["min_5d"]) if str(r["min_5d"]).strip() != "" else None
+        except Exception:
+            max3 = max5 = min5 = None
 
-    # sucesso: max_3d >= +2% (ajustável)
-    w["ret_3d"] = (w["max_3d"] / w["entry_close"] - 1.0) * 100
-    w["dd_5d"] = (w["min_5d"] / w["entry_close"] - 1.0) * 100
-    w["success"] = w["ret_3d"] >= 2.0
+        if max3 is None or max5 is None or min5 is None:
+            rows.append((r["symbol"], r["region"], None, None, None))
+            continue
 
-    out = {
-        "ok": True,
-        "n": int(len(w)),
-        "hit_rate": float(w["success"].mean() * 100),
-        "avg_rebound_3d": float(w["ret_3d"].mean()),
-        "avg_dd_5d": float(w["dd_5d"].mean()),
-        "best_rebound": float(w["ret_3d"].max()),
-        "worst_dd": float(w["dd_5d"].min())
-    }
-    return out
+        rebound5 = (max5 / entry) - 1.0
+        dd5 = (min5 / entry) - 1.0
+        success = rebound5 >= 0.005  # +0.5%
+        rows.append((r["symbol"], r["region"], success, rebound5, dd5))
+    return rows
 
-def propose_small_adjustments(cfg: dict, metrics: dict) -> tuple[dict, str]:
-    """
-    Ajuste automático CONSERVADOR:
-    - só mexe se houver >=30 observações e melhoria esperada plausível.
-    Aqui fazemos uma regra simples:
-      se hit_rate < 60% e dd muito negativo => apertar gate (rsi_max desce 2)
-      se hit_rate > 75% e pouco sinal => relaxar ligeiro (rsi_max sobe 1)
-    Isto é deliberadamente simples para evitar overfitting.
-    """
-    note = "Sem alterações automáticas (evidência insuficiente ou risco de overfitting)."
-    n = metrics.get("n", 0)
-    if not metrics.get("ok") or n < 30:
-        return cfg, note
+def propose_simple_tune(cfg, rows):
+    # Only tune if enough labelled outcomes
+    labelled = [x for x in rows if x[2] is not None]
+    if len(labelled) < cfg["min_sample_for_auto_tune"]:
+        return None, f"amostra insuficiente ({len(labelled)}/{cfg['min_sample_for_auto_tune']})"
 
-    hit = metrics["hit_rate"]
-    dd = metrics["avg_dd_5d"]
+    success_rate = sum(1 for x in labelled if x[2]) / len(labelled)
 
-    changed = False
-    if hit < 60 and dd < -4:
-        cfg["oversold_gate"]["rsi14_max"] = max(26, cfg["oversold_gate"]["rsi14_max"] - 2)
-        cfg["oversold_gate"]["stoch14_max"] = max(15, cfg["oversold_gate"]["stoch14_max"] - 2)
-        changed = True
-        note = f"Ajuste automático: apertar gates (hit {hit:.1f}%, dd {dd:.1f}%)."
-    elif hit > 75:
-        cfg["oversold_gate"]["rsi14_max"] = min(36, cfg["oversold_gate"]["rsi14_max"] + 1)
-        changed = True
-        note = f"Ajuste automático: relaxar ligeiro RSI (hit {hit:.1f}%)."
+    # Minimal, low-complexity adjustments within bounds:
+    # - if success low: tighten score_threshold slightly (reduce false positives)
+    # - if success high: allow a bit more breadth (lower threshold slightly)
+    old_thr = cfg["scoring"]["score_threshold"]
+    new_thr = old_thr
 
-    if changed:
-        cfg["model_version"] = cfg["model_version"] + "_tuned"
-    return cfg, note
+    if success_rate < 0.70:
+        new_thr = min(7.5, old_thr + 0.25)
+    elif success_rate > 0.85:
+        new_thr = max(5.0, old_thr - 0.15)
+
+    if new_thr == old_thr:
+        return None, f"sem alteração (success_rate={success_rate:.2%})"
+
+    cfg2 = json.loads(json.dumps(cfg))
+    cfg2["scoring"]["score_threshold"] = round(new_thr, 2)
+    return cfg2, f"score_threshold {old_thr} → {new_thr} (success_rate={success_rate:.2%})"
 
 def main():
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    cfg = load_cfg()
+    if not os.path.exists(HIST):
+        send_message(TOKEN, CHAT, "*Weekly Review* — sem histórico ainda.")
+        return
 
-    df = load_history()
-    metrics = evaluate_week(df)
-    cfg = load_config()
-    cfg2, note = propose_small_adjustments(cfg, metrics)
+    df = pd.read_csv(HIST)
+    start = weekly_window()
+    df["ts_utc"] = pd.to_datetime(df["ts_utc"], errors="coerce", utc=True)
+    dfw = df[df["ts_utc"] >= start]
 
-    if cfg2 != cfg:
-        save_config(cfg2)
+    rows = evaluate_week(dfw)
 
-    text = ["<b>WEEKLY REVIEW — Oversold Scanner</b>"]
-    text.append(f"Semana (últimos 7 dias):")
-    if not metrics.get("ok"):
-        text.append(f"— {metrics.get('reason')}")
+    labelled = [x for x in rows if x[2] is not None]
+    if labelled:
+        sr = sum(1 for x in labelled if x[2]) / len(labelled)
+        avg_reb = sum(x[3] for x in labelled) / len(labelled)
+        avg_dd = sum(x[4] for x in labelled) / len(labelled)
+        summary = (
+            f"*Weekly Review (últimos 7 dias)*\n"
+            f"- n={len(labelled)}\n"
+            f"- taxa sucesso={sr:.1%}\n"
+            f"- rebound médio (5d)={avg_reb:.2%}\n"
+            f"- drawdown médio (5d)={avg_dd:.2%}\n"
+        )
     else:
-        text.append(f"N={metrics['n']} | Hit-rate: {metrics['hit_rate']:.1f}%")
-        text.append(f"Rebound médio 3d: {metrics['avg_rebound_3d']:.2f}%")
-        text.append(f"Drawdown médio 5d: {metrics['avg_dd_5d']:.2f}%")
-        text.append(f"Melhor rebound 3d: {metrics['best_rebound']:.2f}%")
-        text.append(f"Pior DD 5d: {metrics['worst_dd']:.2f}%")
-    text.append("")
-    text.append(note)
-    send_telegram_message(token, chat_id, "\n".join(text))
+        summary = "*Weekly Review (últimos 7 dias)*\n- resultados ainda insuficientes (outcomes em falta)."
+
+    tune_msg = ""
+    if cfg.get("auto_tune_enabled", False):
+        new_cfg, msg = propose_simple_tune(cfg, rows)
+        tune_msg = f"\n*Auto-tune*: {msg}"
+        if new_cfg is not None:
+            save_cfg(new_cfg)
+
+    # list top failures/successes
+    lines = [summary + tune_msg, "\n*Notas*",
+             "- Sem invenções: se max/min 5d ainda não preenchidos, não avalia.",
+             "- Ajustes só em thresholds simples, sem aumentar complexidade."]
+
+    send_message(TOKEN, CHAT, "\n".join(lines))
 
 if __name__ == "__main__":
     main()
