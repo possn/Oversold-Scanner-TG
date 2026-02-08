@@ -1,61 +1,72 @@
 import numpy as np
 import pandas as pd
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
     gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
 
-    rs = avg_gain / (avg_loss.replace(0, np.nan))
-    rsi_ = 100 - (100 / (1 + rs))
-    return rsi_.fillna(method="bfill")
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-def stochastic_k(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    low_min = df["Low"].rolling(period).min()
-    high_max = df["High"].rolling(period).max()
-    k = 100 * (df["Close"] - low_min) / (high_max - low_min)
-    return k.replace([np.inf, -np.inf], np.nan).fillna(method="bfill")
+def stoch_k(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    lowest = low.rolling(period).min()
+    highest = high.rolling(period).max()
+    return 100 * (close - lowest) / (highest - lowest)
 
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).mean()
+def sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).mean()
 
-def roc(series: pd.Series, period: int = 20) -> pd.Series:
-    return 100 * (series / series.shift(period) - 1.0)
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
-def zscore(series: pd.Series, period: int = 20) -> pd.Series:
-    mean = series.rolling(period).mean()
-    std = series.rolling(period).std()
-    return (series - mean) / std.replace(0, np.nan)
+def pct_change(series: pd.Series, n: int) -> pd.Series:
+    return series.pct_change(n)
 
-def candle_reversal_score(df: pd.DataFrame) -> float:
-    """
-    Heurística simples (pública e verificável) de reversão:
-    - martelo/hammer aproximado
-    - engulfing bullish aproximado
-    Devolve 0..1.5 (para ser mapeado no score pattern).
-    """
-    if len(df) < 3:
-        return 0.0
-    last = df.iloc[-1]
+def candle_features(df: pd.DataFrame) -> pd.DataFrame:
+    # expects columns: Open High Low Close Volume
+    out = df.copy()
+    out["body"] = (out["Close"] - out["Open"]).abs()
+    out["range"] = (out["High"] - out["Low"]).replace(0, np.nan)
+    out["upper_wick"] = out["High"] - out[["Open", "Close"]].max(axis=1)
+    out["lower_wick"] = out[["Open", "Close"]].min(axis=1) - out["Low"]
+    out["is_green"] = out["Close"] > out["Open"]
+    return out
+
+def pattern_hammer(df: pd.DataFrame) -> bool:
+    # last candle hammer-ish: long lower wick, small body
+    if len(df) < 2:
+        return False
+    c = candle_features(df).iloc[-1]
+    if pd.isna(c["range"]):
+        return False
+    return (c["lower_wick"] >= 2.0 * c["body"]) and (c["upper_wick"] <= 0.6 * c["body"])
+
+def pattern_bullish_engulfing(df: pd.DataFrame) -> bool:
+    if len(df) < 2:
+        return False
     prev = df.iloc[-2]
+    last = df.iloc[-1]
+    return (prev["Close"] < prev["Open"]) and (last["Close"] > last["Open"]) and (last["Open"] < prev["Close"]) and (last["Close"] > prev["Open"])
 
-    body = abs(last["Close"] - last["Open"])
-    rng = last["High"] - last["Low"]
-    if rng == 0:
-        return 0.0
-
-    lower_wick = min(last["Open"], last["Close"]) - last["Low"]
-    upper_wick = last["High"] - max(last["Open"], last["Close"])
-
-    hammer = (lower_wick / rng > 0.55) and (upper_wick / rng < 0.2) and (body / rng < 0.25)
-    engulf = (last["Close"] > last["Open"]) and (prev["Close"] < prev["Open"]) and (last["Close"] >= prev["Open"]) and (last["Open"] <= prev["Close"])
-
-    score = 0.0
-    if hammer:
-        score += 0.8
-    if engulf:
-        score += 0.7
-    return score
+def rsi_divergence_proxy(close: pd.Series, rsi_series: pd.Series) -> bool:
+    # proxy: price makes lower low last 10 bars but RSI makes higher low
+    if len(close) < 20:
+        return False
+    w = 10
+    c = close.iloc[-w:]
+    r = rsi_series.iloc[-w:]
+    if c.isna().any() or r.isna().any():
+        return False
+    price_ll = c.iloc[-1] < c.min()
+    rsi_hl = r.iloc[-1] > r.min()
+    return bool(price_ll and rsi_hl)
