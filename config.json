@@ -1,6 +1,57 @@
 {
-  "rsi_oversold": 30,
-  "min_volume": 1000000,
-  "lookback_days": 200,
-  "score_threshold": 5
+  "version": "v1.0_frozen_confluence",
+  "timezone": "Europe/Lisbon",
+
+  "min_sample_for_auto_tune": 20,
+  "auto_tune_enabled": true,
+
+  "liquidity": {
+    "min_avg_volume_20d": 800000,
+    "min_avg_dollar_volume_20d": 8000000
+  },
+
+  "earnings": {
+    "exclude_if_within_days": 7,
+    "strict_if_missing": true
+  },
+
+  "scoring": {
+    "score_threshold": 6.0,
+    "weights": {
+      "quant": 3.0,
+      "pattern": 3.0,
+      "fundamentals": 2.0,
+      "narrative": 2.0
+    }
+  },
+
+  "quant": {
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "stoch_period": 14,
+    "stoch_oversold": 20,
+    "ma_windows": [20, 50, 200],
+    "momentum_5d_min": -0.02
+  },
+
+  "extreme_setup": {
+    "rsi_extreme": 22,
+    "stoch_extreme": 10
+  },
+
+  "t_plus_1": {
+    "enabled": true,
+    "non_extreme_requires_confirmation": true
+  },
+
+  "outputs": {
+    "top_per_reset": 5,
+    "max_candidates_scanned": 250,
+    "max_report_lines": 80
+  },
+
+  "universes": {
+    "US": ["sp500", "nasdaq100"],
+    "EU": ["eurostoxx50", "euronext100", "psi20"]
+  }
 }
