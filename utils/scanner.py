@@ -282,3 +282,80 @@ def scan_symbols(symbols: List[str], cfg: dict, region_name: str, audit) -> Tupl
 
     audit.ok("1_resets_ABC")
     return candidates, f"{region_name}: scanned={scanned}, kept={len(candidates)}"
+
+def three_resets(symbols: List[str]) -> Dict[str, List[str]]:
+    # deterministic seeds (no anchoring with previous runs)
+    arr = np.array(symbols, dtype=object)
+    A = arr.copy(); np.random.default_rng(101).shuffle(A)
+    B = arr.copy(); np.random.default_rng(202).shuffle(B)
+    C = arr.copy(); np.random.default_rng(303).shuffle(C)
+    return {"A": A.tolist(), "B": B.tolist(), "C": C.tolist()}
+
+def pick_top_per_reset(cands: List[Candidate], top_n: int) -> List[Candidate]:
+    c = sorted(cands, key=lambda x: x.score, reverse=True)
+    return c[:top_n]
+
+def intersection_2_of_3(topA: List[Candidate], topB: List[Candidate], topC: List[Candidate]) -> Dict[str, int]:
+    from collections import Counter
+    syms = [c.symbol for c in topA] + [c.symbol for c in topB] + [c.symbol for c in topC]
+    cnt = Counter(syms)
+    return {k: v for k, v in cnt.items() if v >= 2}
+
+def render_report(region: str, audit, reset_tops: Dict[str, List[Candidate]], inter: Dict[str, int], cfg: dict, meta: str) -> str:
+    lines = [f"*{region} — Oversold Confluence ({cfg['version']})*"]
+    lines.append(meta)
+    lines.append("")
+    lines.append(audit.render())
+    lines.append("\n*Top 5 por reset (A/B/C)*")
+    for key in ["A","B","C"]:
+        lines.append(f"\n*Reset {key}*")
+        for c in reset_tops[key]:
+            t1 = "T+1" if c.needs_t1 else "HOJE"
+            lines.append(f"- {c.symbol} | score {c.score} | {t1}")
+
+    lines.append("\n*INTERSECÇÃO (≥2/3)*")
+    if not inter:
+        lines.append("- (vazio) → FLAT")
+        return "\n".join(lines)
+
+    # Now render executables
+    lines.append("\n*Executáveis (≥2/3 + score≥threshold + dados suficientes)*")
+    execs = []
+    for key in ["A","B","C"]:
+        execs.extend(reset_tops[key])
+    # unique by symbol, keep best score
+    best = {}
+    for c in execs:
+        if (c.symbol not in best) or (c.score > best[c.symbol].score):
+            best[c.symbol] = c
+
+    threshold = cfg["scoring"]["score_threshold"]
+    shown = 0
+    for sym, cnt in sorted(inter.items(), key=lambda kv: (-best[kv[0]].score, -kv[1])):
+        c = best.get(sym)
+        if not c:
+            continue
+        if c.score < threshold:
+            continue
+        if c.data_status == "insufficient":
+            continue
+
+        decision = "AGUARDAR (T+1)" if c.needs_t1 else "EXECUTÁVEL"
+        lines.append(
+            f"\n*{sym}* — {decision}\n"
+            f"- score {c.score} | Prob×Payoff: {c.prob}×{c.payoff}\n"
+            f"- rótulo: {c.label}\n"
+            f"- invalidação: {c.invalidation}\n"
+            f"- breakdown: Q{c.score_breakdown['quant']:.1f}/3, P{c.score_breakdown['pattern']:.1f}/3, F{c.score_breakdown['fund']:.1f}/2, N{c.score_breakdown['narr']:.1f}/2\n"
+            f"- earnings: {c.earnings}\n"
+            f"- nota: {c.note}\n"
+            f"- narrativa: {c.news}"
+        )
+        shown += 1
+        if shown >= 8:
+            break
+
+    if shown == 0:
+        lines.append("- Nenhuma ação cumpriu thresholds/dados → FLAT")
+
+    return "\n".join(lines)
